@@ -1,0 +1,8 @@
+logs/
+.idea/
+.csv
+__pycache__/
+.ini
+.sqlsync/
+.config.ini
+
