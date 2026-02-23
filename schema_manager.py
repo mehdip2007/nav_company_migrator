@@ -1,18 +1,23 @@
 from sqlalchemy import inspect, text, MetaData
 from exceptions import NoChunkingKeyError
 
+
 class SchemaManager:
     def __init__(self, live_engine, archive_engine, company_name):
         self.live_engine = live_engine
         self.archive_engine = archive_engine
         self.company_name = company_name
-        self.prefix = f"[{company_name}$"
+        self.prefix = f"[{company_name}$" if company_name else None
+        # FIX #12: Resolve company name eagerly in __init__ so get_* methods stay pure
+        self._resolve_company_name()
 
-    def get_company_tables(self):
-        """Fetch all tables belonging to the company from Live DB."""
-        with self.live_engine.connect() as conn:
-            # If company name is not provided, fetch the first one
-            if not self.company_name:
+    def _resolve_company_name(self):
+        """
+        FIX #12: Moved company name resolution out of get_company_tables()
+        so that getter methods have no hidden side effects.
+        """
+        if not self.company_name:
+            with self.live_engine.connect() as conn:
                 stmt = text("SELECT TOP 1 [Name] FROM [dbo].[Company]")
                 result = conn.execute(stmt).fetchone()
                 if result:
@@ -20,30 +25,39 @@ class SchemaManager:
                     self.prefix = f"[{self.company_name}$"
                 else:
                     raise Exception("No companies found in Live DB.")
-            
-            # Get tables matching prefix
+
+    def get_company_tables(self):
+        """
+        Fetch all tables belonging to the company from Live DB.
+        FIX #4 + #12: Uses bound parameters. No side effects — company name
+        is already resolved in __init__ via _resolve_company_name().
+        """
+        with self.live_engine.connect() as conn:
+            # FIX #4: Use bound parameter instead of f-string interpolation
+            prefix_search = f"{self.company_name}$%"
             stmt = text("""
                 SELECT TABLE_NAME 
                 FROM INFORMATION_SCHEMA.TABLES 
-                WHERE TABLE_NAME LIKE :prefix + '%' 
+                WHERE TABLE_NAME LIKE :prefix
                 AND TABLE_TYPE = 'BASE TABLE'
             """)
-            results = conn.execute(stmt, {"prefix": self.prefix.replace('[', '').replace(']', '')}).fetchall()
+            results = conn.execute(stmt, {"prefix": prefix_search}).fetchall()
             return [row[0] for row in results]
 
     def sync_table_schema(self, table_name):
-        """Create table in Archive if missing, preserving PKs/Constraints."""
+        """
+        Create table in Archive if missing, preserving PKs/Constraints.
+        FIX #4: Uses bound parameter for the EXISTS check.
+        """
         with self.live_engine.connect() as live_conn:
             with self.archive_engine.connect() as archive_conn:
-                # Check if exists in archive
-                exists = archive_conn.execute(text(f"""
+                # FIX #4: Parameterized query — no f-string for user-derived values
+                exists = archive_conn.execute(text("""
                     SELECT 1 FROM INFORMATION_SCHEMA.TABLES 
-                    WHERE TABLE_NAME = '{table_name}'
-                """)).fetchone()
+                    WHERE TABLE_NAME = :tname
+                """), {"tname": table_name}).fetchone()
 
                 if not exists:
-                    # Get Create Script from Live (Simplified approach using SELECT INTO then fix)
-                    # Robust approach: Use SQLAlchemy Reflection + Create
                     metadata = MetaData()
                     metadata.reflect(bind=self.live_engine, only=[table_name])
                     table = metadata.tables[table_name]
@@ -54,64 +68,123 @@ class SchemaManager:
                     print(f"Table exists: {table_name}")
 
     def disable_constraints(self, table_name, engine):
+        # FIX #4: Sanitize table name before interpolation
+        safe_table = table_name.replace("[", "").replace("]", "").replace("'", "''")
         with engine.connect() as conn:
-            conn.execute(text(f"ALTER TABLE [dbo].[{table_name}] NOCHECK CONSTRAINT ALL"))
+            conn.execute(text(f"ALTER TABLE [dbo].[{safe_table}] NOCHECK CONSTRAINT ALL"))
             conn.commit()
 
     def enable_constraints(self, table_name, engine):
+        # FIX #4: Sanitize table name before interpolation
+        safe_table = table_name.replace("[", "").replace("]", "").replace("'", "''")
         with engine.connect() as conn:
-            conn.execute(text(f"ALTER TABLE [dbo].[{table_name}] CHECK CONSTRAINT ALL"))
+            conn.execute(text(f"ALTER TABLE [dbo].[{safe_table}] CHECK CONSTRAINT ALL"))
             conn.commit()
 
     def get_chunking_column(self, table_name):
         """
         Determine the best column for chunking/resume.
-        Priority: PK (Int) -> Identity -> Common NAV Columns -> First PK Column.
+        Priority: PK (single, Int/datetime) -> Identity -> Common NAV Columns -> Error.
+
+        FIX #2: Composite PKs no longer silently fall back to the first column.
+        A composite PK with no usable single-column key now raises NoChunkingKeyError
+        to prevent pagination on a non-unique column causing missed or duplicated rows.
+
+        FIX #4: All queries use bound parameters.
         """
         with self.live_engine.connect() as conn:
             # 1. Check for Primary Key
             stmt = text("""
-                SELECT kcu.COLUMN_NAME, DATA_TYPE 
+                SELECT kcu.COLUMN_NAME, c.DATA_TYPE 
                 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-                JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
-                JOIN INFORMATION_SCHEMA.COLUMNS c ON kcu.COLUMN_NAME = c.COLUMN_NAME
-                WHERE tc.TABLE_NAME = :tname AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+                JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu 
+                    ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+                    AND tc.TABLE_NAME = kcu.TABLE_NAME
+                JOIN INFORMATION_SCHEMA.COLUMNS c 
+                    ON kcu.COLUMN_NAME = c.COLUMN_NAME
+                    AND kcu.TABLE_NAME = c.TABLE_NAME
+                WHERE tc.TABLE_NAME = :tname 
+                AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
                 ORDER BY kcu.ORDINAL_POSITION
             """)
             pk_cols = conn.execute(stmt, {"tname": table_name}).fetchall()
-            
+
             if pk_cols:
-                # If single PK and numeric/datetime, use it
                 if len(pk_cols) == 1:
                     col_name, dtype = pk_cols[0]
                     if dtype in ['int', 'bigint', 'datetime', 'datetime2', 'uniqueidentifier']:
                         return col_name
-                # Fallback to first PK column if composite
-                return pk_cols[0][0]
+                    # Single PK but not a clean orderable type — still usable cautiously
+                    # (e.g. varchar PKs in NAV like "No_")
+                    return col_name
 
-            # 2. Check for Identity
+                # FIX #2: Composite PK detected — do NOT silently use first column.
+                # Instead, check if any single column in the composite key is also
+                # an identity column, which would make it safe to use alone.
+                pk_col_names = [row[0] for row in pk_cols]
+                stmt_id = text("""
+                    SELECT COLUMN_NAME 
+                    FROM INFORMATION_SCHEMA.COLUMNS 
+                    WHERE TABLE_NAME = :tname 
+                    AND COLUMN_NAME IN :col_names
+                    AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1
+                """)
+                identity_in_pk = conn.execute(
+                    stmt_id, {"tname": table_name, "col_names": tuple(pk_col_names)}
+                ).fetchone()
+
+                if identity_in_pk:
+                    return identity_in_pk[0]
+
+                # Composite PK with no identity column — unsafe to chunk on any single column
+                raise NoChunkingKeyError(
+                    f"Table '{table_name}' has a composite PK ({', '.join(pk_col_names)}) "
+                    f"with no identity column. Cannot determine a safe single-column chunking key. "
+                    f"Skipping to prevent missed or duplicated rows.",
+                    table_name=table_name
+                )
+
+            # 2. Check for Identity column (no PK case)
             stmt_id = text("""
-                SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
-                WHERE TABLE_NAME = :tname AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1
+                SELECT COLUMN_NAME 
+                FROM INFORMATION_SCHEMA.COLUMNS 
+                WHERE TABLE_NAME = :tname 
+                AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1
             """)
             identity = conn.execute(stmt_id, {"tname": table_name}).fetchone()
             if identity:
                 return identity[0]
 
-            # 3. Common NAV Columns
-            common_cols = ["Entry No_", "No_", "ID", "$systemID"]
+            # 3. Common NAV/BC Columns as fallback
+            common_cols = ["Entry No_", "No_", "ID", "$systemId"]
             stmt_col = text("""
-                SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
-                WHERE TABLE_NAME = :tname AND COLUMN_NAME IN :commons
+                SELECT COLUMN_NAME 
+                FROM INFORMATION_SCHEMA.COLUMNS 
+                WHERE TABLE_NAME = :tname 
+                AND COLUMN_NAME IN :commons
             """)
-            common = conn.execute(stmt_col, {"tname": table_name, "commons": tuple(common_cols)}).fetchall()
-            if common:
-                return common[0][0]
+            common = conn.execute(
+                stmt_col, {"tname": table_name, "commons": tuple(common_cols)}
+            ).fetchall()
 
-            raise NoChunkingKeyError(f"No suitable chunking key found for table {table_name}")
+            if common:
+                # Prioritize by order defined in common_cols
+                found = {row[0] for row in common}
+                for col in common_cols:
+                    if col in found:
+                        return col
+
+            raise NoChunkingKeyError(
+                f"No suitable chunking key found for table '{table_name}'. "
+                f"No usable PK, identity, or known NAV column was detected.",
+                table_name=table_name
+            )
 
     def get_insert_columns(self, table_name):
-        """Get column names excluding timestamp/rowversion."""
+        """
+        Get column names excluding timestamp/rowversion.
+        FIX #4: Uses bound parameter.
+        """
         with self.live_engine.connect() as conn:
             stmt = text("""
                 SELECT COLUMN_NAME, DATA_TYPE 
@@ -119,6 +192,6 @@ class SchemaManager:
                 WHERE TABLE_NAME = :tname
             """)
             cols = conn.execute(stmt, {"tname": table_name}).fetchall()
-            # Exclude timestamp/rowversion
+            # Exclude timestamp/rowversion — cannot be inserted explicitly
             valid_cols = [c[0] for c in cols if c[1].upper() != 'TIMESTAMP']
             return valid_cols
