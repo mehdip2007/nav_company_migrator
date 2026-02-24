@@ -7,10 +7,16 @@ from logger import LoggerSetup
 from tabulate import tabulate
 
 
-def print_summary(stats_list, log_file):
-    print("\n" + "=" * 80)
-    print("MIGRATION SUMMARY")
-    print("=" * 80)
+def print_summary(stats_list, log_file, logger):
+    """
+    FIX: Summary now written to both console and log file.
+    Includes per-table breakdown plus totals.
+    """
+    lines = []
+    lines.append("")
+    lines.append("=" * 80)
+    lines.append("MIGRATION SUMMARY")
+    lines.append("=" * 80)
 
     table_data = []
     total_rows = 0
@@ -20,10 +26,12 @@ def print_summary(stats_list, log_file):
         remaining = stats.total_source_rows - stats.rows_migrated
         speed = f"{stats.rows_per_second:.2f} rows/sec"
         status = "SUCCESS" if len(stats.errors) == 0 else "FAILED"
+        mode = getattr(stats, "mode", "key").upper()
 
         table_data.append([
             stats.table_name,
             status,
+            mode,
             stats.total_source_rows,
             stats.rows_migrated,
             remaining,
@@ -34,16 +42,27 @@ def print_summary(stats_list, log_file):
         total_rows += stats.rows_migrated
         total_duration += stats.duration_seconds
 
-    headers = ["Table", "Status", "Source Count", "Migrated", "Remaining", "Duration", "Throughput"]
-    print(tabulate(table_data, headers=headers, tablefmt="grid"))
+    headers = ["Table", "Status", "Mode", "Source Count", "Migrated", "Remaining", "Duration", "Throughput"]
+    table_str = tabulate(table_data, headers=headers, tablefmt="grid")
 
-    print("\n" + "=" * 80)
-    print(f"TOTAL ROWS MIGRATED: {total_rows}")
-    print(f"TOTAL DURATION: {total_duration:.2f} seconds")
+    lines.append(table_str)
+    lines.append("")
+    lines.append("=" * 80)
+    lines.append(f"TOTAL ROWS MIGRATED: {total_rows}")
+    lines.append(f"TOTAL DURATION: {total_duration:.2f} seconds")
     if total_duration > 0:
-        print(f"OVERALL THROUGHPUT: {total_rows / total_duration:.2f} rows/sec")
-    print(f"LOG FILE: {log_file}")
-    print("=" * 80 + "\n")
+        lines.append(f"OVERALL THROUGHPUT: {total_rows / total_duration:.2f} rows/sec")
+    lines.append(f"LOG FILE: {log_file}")
+    lines.append("=" * 80)
+    lines.append("")
+
+    # Print to console
+    for line in lines:
+        print(line)
+
+    # FIX: Also write every summary line to the log file
+    for line in lines:
+        logger.info(line)
 
 
 def main():
@@ -95,20 +114,15 @@ def main():
                 columns = schema_mgr.get_insert_columns(table)
 
                 # --- Strategy Selection ---
-                # Try key-based chunking first (fastest, resumable by value).
-                # On NoChunkingKeyError (composite PK tables), automatically fall back
-                # to offset-based pagination — no tables are skipped anymore.
+                # Key-based first (fastest). Falls back to offset for composite PKs.
                 try:
                     chunk_key = schema_mgr.get_chunking_column(table)
-                    # Key-based migration (single/identity PK tables)
                     migrator.migrate_table(table, chunk_key, columns)
 
                 except NoChunkingKeyError:
-                    # Composite PK with no identity — use OFFSET/FETCH strategy
                     pk_cols = schema_mgr.get_pk_columns(table)
 
                     if not pk_cols:
-                        # Truly no PK and no usable key — last resort: log and skip
                         logger.warning(
                             f"Skipping '{table}': no PK, no identity, and no known NAV columns. "
                             f"Cannot determine a safe migration strategy."
@@ -125,8 +139,8 @@ def main():
                 logger.critical(f"CRITICAL ERROR on {table}: {e}")
                 continue
 
-        # 7. Print Summary
-        print_summary(migrator.get_summary(), logger_setup.log_file_path)
+        # 7. Print + Log Summary (FIX: logger passed so summary goes to log file too)
+        print_summary(migrator.get_summary(), logger_setup.log_file_path, logger)
         logger.info("Migration Process Finished.")
 
     except Exception as e:
