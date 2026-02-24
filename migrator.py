@@ -255,5 +255,170 @@ class DataMigrator:
                     f"Migrated: {stats.rows_migrated}"
                 )
 
+    def migrate_table_by_offset(self, table_name, pk_cols, columns):
+        """
+        Offset-based migration for composite PK tables with no usable single chunking key.
+
+        Strategy:
+          - Uses OFFSET x ROWS FETCH NEXT batch_size ROWS ONLY with ORDER BY all PK columns.
+          - Checkpoint stores the current offset as a plain integer string in ETL_State.
+          - On resume, reads the offset from ETL_State and picks up exactly where it left off.
+          - Dedup: On a fresh start it checks archive row count to detect partial previous runs
+            and fast-forwards the offset to skip already-migrated rows.
+
+        This handles all NAV/BC composite PK tables like:
+          Selected Dimension, Country_Region Translation, Dimension Value, etc.
+        """
+        stats = MigrationStats(table_name)
+        stats.start_time = time.time()
+
+        # Sanitize all names
+        safe_table = table_name.replace("[", "").replace("]", "").replace("'", "''")
+        safe_pk_cols = [c.replace("[", "").replace("]", "").replace("'", "''") for c in pk_cols]
+        safe_columns = [c.replace("[", "").replace("]", "").replace("'", "''") for c in columns]
+
+        self.logger.info(f"[OFFSET MODE] Starting migration for table: {table_name} | PK: {pk_cols}")
+
+        # 1. Get total source count
+        stats.total_source_rows = self.get_source_count(table_name)
+
+        if stats.total_source_rows == 0:
+            self.logger.info(f"Table {table_name} is empty. Skipping.")
+            stats.end_time = time.time()
+            self.completed_stats.append(stats)
+            return
+
+        # 2. Resolve starting offset
+        # Priority: ETL_State checkpoint (stored as int string) -> archive row count -> 0
+        checkpoint = self.state_manager.get_checkpoint(table_name)
+        if checkpoint is not None:
+            try:
+                current_offset = int(checkpoint)
+                self.logger.info(f"Resuming {table_name} from offset {current_offset}")
+            except ValueError:
+                # Checkpoint exists but isn't an integer — was previously run in key mode
+                # Start fresh to be safe
+                current_offset = 0
+        else:
+            # No checkpoint — check if archive already has rows (partial previous run without checkpoint)
+            try:
+                with self.archive_engine.connect() as conn:
+                    archive_count = conn.execute(
+                        text(f"SELECT COUNT(*) FROM [{self.archive_db}].[dbo].[{safe_table}]")
+                    ).fetchone()[0]
+                if archive_count > 0:
+                    current_offset = archive_count
+                    self.logger.info(
+                        f"No checkpoint for {table_name} but archive has {archive_count} rows. "
+                        f"Fast-forwarding offset to {current_offset}."
+                    )
+                else:
+                    current_offset = 0
+            except Exception as e:
+                self.logger.warning(f"Could not read archive count for {table_name}: {e}. Starting from offset 0.")
+                current_offset = 0
+
+        # 3. Disable Constraints
+        constraints_disabled = False
+        try:
+            with self.archive_engine.connect() as conn:
+                conn.execute(text(f"ALTER TABLE [dbo].[{safe_table}] NOCHECK CONSTRAINT ALL"))
+                conn.commit()
+                constraints_disabled = True
+        except Exception as e:
+            err = MigrationError(f"Failed to disable constraints: {str(e)}", table_name)
+            self.logger.error(str(err))
+            stats.errors.append(str(err))
+            stats.end_time = time.time()
+            self.completed_stats.append(stats)
+            return
+
+        try:
+            col_list = ", ".join([f"[{c}]" for c in safe_columns])
+            order_clause = ", ".join([f"[{c}]" for c in safe_pk_cols])
+
+            pbar = tqdm(
+                total=stats.total_source_rows,
+                desc=f"[OFFSET] {table_name}",
+                unit="rows",
+                initial=current_offset  # Start bar from already-migrated count
+            )
+
+            while True:
+                # OFFSET/FETCH — safe for any column type, works with composite PKs
+                sql = f"""
+                    INSERT INTO [{self.archive_db}].[dbo].[{safe_table}] ({col_list})
+                    SELECT {col_list}
+                    FROM [{self.live_db}].[dbo].[{safe_table}] WITH (NOLOCK)
+                    ORDER BY {order_clause}
+                    OFFSET {current_offset} ROWS FETCH NEXT {self.batch_size} ROWS ONLY
+                """
+
+                try:
+                    with self.archive_engine.connect() as conn:
+                        result = conn.execute(text(sql))
+                        conn.commit()
+                        rows_affected = result.rowcount
+
+                    if rows_affected == 0:
+                        break
+
+                    current_offset += rows_affected
+                    stats.rows_migrated += rows_affected
+                    pbar.update(rows_affected)
+
+                    # Checkpoint stores offset as string (ETL_State is NVARCHAR)
+                    self.state_manager.update_checkpoint(table_name, str(current_offset), "Running")
+
+                except Exception as e:
+                    raise MigrationBatchError(
+                        message=f"Offset batch insert failed: {str(e)}",
+                        table_name=table_name,
+                        current_key=current_offset
+                    )
+
+            pbar.close()
+
+        except MigrationBatchError as e:
+            self.logger.error(str(e))
+            stats.errors.append(str(e))
+
+        except Exception as e:
+            err = MigrationError(f"Unexpected error in offset migration loop: {str(e)}", table_name)
+            self.logger.critical(str(err))
+            stats.errors.append(str(err))
+
+        finally:
+            if constraints_disabled:
+                try:
+                    with self.archive_engine.connect() as conn:
+                        conn.execute(text(f"ALTER TABLE [dbo].[{safe_table}] CHECK CONSTRAINT ALL"))
+                        conn.commit()
+                    self.logger.info(f"Constraints re-enabled for {table_name}")
+                except Exception as e:
+                    self.logger.error(f"Failed to enable constraints for {table_name}: {e}")
+
+            stats.end_time = time.time()
+
+            final_status = "Completed" if len(stats.errors) == 0 else "Failed"
+            try:
+                self.state_manager.update_checkpoint(table_name, str(current_offset), final_status)
+            except Exception as e:
+                self.logger.warning(f"Could not write final status for {table_name}: {e}")
+
+            self.completed_stats.append(stats)
+
+            if len(stats.errors) == 0:
+                self.logger.info(
+                    f"[OFFSET MODE] Completed {table_name}. "
+                    f"Migrated: {stats.rows_migrated}, "
+                    f"Duration: {stats.duration_seconds:.2f}s"
+                )
+            else:
+                self.logger.warning(
+                    f"[OFFSET MODE] Finished {table_name} with errors. "
+                    f"Migrated: {stats.rows_migrated}"
+                )
+
     def get_summary(self):
         return self.completed_stats

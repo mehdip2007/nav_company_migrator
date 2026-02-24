@@ -187,6 +187,26 @@ class SchemaManager:
                 table_name=table_name
             )
 
+    def get_pk_columns(self, table_name):
+        """
+        Return all PK column names for a table in ordinal order.
+        Used by the offset-based migrator as the ORDER BY clause for composite PK tables.
+        Returns an empty list if no PK is defined.
+        """
+        with self.live_engine.connect() as conn:
+            stmt = text("""
+                SELECT kcu.COLUMN_NAME
+                FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+                    ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+                    AND tc.TABLE_NAME = kcu.TABLE_NAME
+                WHERE tc.TABLE_NAME = :tname
+                AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+                ORDER BY kcu.ORDINAL_POSITION
+            """)
+            rows = conn.execute(stmt, {"tname": table_name}).fetchall()
+            return [row[0] for row in rows]
+
     def get_insert_columns(self, table_name):
         """
         Get column names excluding timestamp/rowversion.
