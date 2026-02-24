@@ -26,7 +26,13 @@ class DatabaseConnector:
                 f"MARS_Connection=Yes;"
             )
             odbc_connect = urllib.parse.quote_plus(odbc_str)
-            engine = create_engine(f"mssql+pyodbc:///?odbc_connect={odbc_connect}")
+            engine = create_engine(
+                    f"mssql+pyodbc:///?odbc_connect={odbc_connect}",
+                    pool_size=5,           # number of persistent connections kept open
+                    max_overflow=10,       # extra connections allowed beyond pool_size under load
+                    pool_timeout=30,       # seconds to wait for a connection before raising
+                    pool_pre_ping=True     # tests connection health before use — auto-reconnects stale ones
+                    )
             # Test connection
             with engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
