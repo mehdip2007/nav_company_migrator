@@ -121,20 +121,29 @@ class SchemaManager:
                 # FIX #2: Composite PK detected — do NOT silently use first column.
                 # Instead, check if any single column in the composite key is also
                 # an identity column, which would make it safe to use alone.
+                #
+                # FIX (pyodbc TVP bug): SQL Server via pyodbc cannot handle a Python tuple
+                # as a bound parameter for IN clauses — it tries to interpret it as a
+                # Table-Valued Parameter and throws error 2715 or "incorrect syntax near @P2".
+                # Solution: fetch ALL identity columns for the table without an IN filter,
+                # then intersect with pk_col_names in Python. Cleaner and avoids the issue.
                 pk_col_names = [row[0] for row in pk_cols]
                 stmt_id = text("""
                     SELECT COLUMN_NAME 
                     FROM INFORMATION_SCHEMA.COLUMNS 
                     WHERE TABLE_NAME = :tname 
-                    AND COLUMN_NAME IN :col_names
                     AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1
                 """)
-                identity_in_pk = conn.execute(
-                    stmt_id, {"tname": table_name, "col_names": tuple(pk_col_names)}
-                ).fetchone()
+                all_identity_cols = {
+                    row[0] for row in conn.execute(stmt_id, {"tname": table_name}).fetchall()
+                }
+                # Find the first PK column that is also an identity column
+                identity_in_pk = next(
+                    (col for col in pk_col_names if col in all_identity_cols), None
+                )
 
                 if identity_in_pk:
-                    return identity_in_pk[0]
+                    return identity_in_pk
 
                 # Composite PK with no identity column — unsafe to chunk on any single column
                 raise NoChunkingKeyError(
@@ -156,23 +165,21 @@ class SchemaManager:
                 return identity[0]
 
             # 3. Common NAV/BC Columns as fallback
+            # FIX (pyodbc TVP bug): Same issue — tuple in IN clause breaks pyodbc.
+            # Fetch ALL column names for the table and intersect in Python instead.
             common_cols = ["Entry No_", "No_", "ID", "$systemId"]
             stmt_col = text("""
                 SELECT COLUMN_NAME 
                 FROM INFORMATION_SCHEMA.COLUMNS 
-                WHERE TABLE_NAME = :tname 
-                AND COLUMN_NAME IN :commons
+                WHERE TABLE_NAME = :tname
             """)
-            common = conn.execute(
-                stmt_col, {"tname": table_name, "commons": tuple(common_cols)}
-            ).fetchall()
-
-            if common:
-                # Prioritize by order defined in common_cols
-                found = {row[0] for row in common}
-                for col in common_cols:
-                    if col in found:
-                        return col
+            all_cols = {
+                row[0] for row in conn.execute(stmt_col, {"tname": table_name}).fetchall()
+            }
+            # Prioritize by order defined in common_cols
+            for col in common_cols:
+                if col in all_cols:
+                    return col
 
             raise NoChunkingKeyError(
                 f"No suitable chunking key found for table '{table_name}'. "
